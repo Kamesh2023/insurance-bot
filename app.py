@@ -2,6 +2,7 @@ import os
 import io
 import json
 import time
+import threading
 from datetime import date
 
 import markdown
@@ -44,10 +45,39 @@ llm = OpenAI(
 )
 
 
+# Requests per minute the app will send. Free tier for this model allows 5; we use 4 for a safety margin.
+# If you turn on billing, set GEMINI_RPM in Secrets to a higher number, e.g. 100.
+GEMINI_RPM = int(get_setting("GEMINI_RPM", 4))
+
+
+@st.cache_resource
+def shared_request_log():
+    """One log shared by ALL visitors, because they all use the same Gemini quota."""
+    return {"times": [], "lock": threading.Lock()}
+
+
+def wait_for_free_slot():
+    """Hold the request until it fits within GEMINI_RPM over the last 60 seconds."""
+    log = shared_request_log()
+    note = st.empty()
+    while True:
+        with log["lock"]:
+            now = time.time()
+            log["times"] = [t for t in log["times"] if now - t < 60]
+            if len(log["times"]) < GEMINI_RPM:
+                log["times"].append(now)
+                note.empty()
+                return
+            wait = int(60 - (now - log["times"][0])) + 1
+        note.caption(f"⏳ Pacing requests to stay within the free limit... about {wait}s")
+        time.sleep(min(wait, 5))
+
+
 def ask_gemini(**kwargs):
-    """Call Gemini; if the free-tier per-minute limit is hit, wait and try again."""
+    """Call Gemini within the per-minute limit; if still refused, wait and try again."""
     waits = [15, 30, 45]  # seconds
     for attempt in range(len(waits) + 1):
+        wait_for_free_slot()
         try:
             return llm.chat.completions.create(**kwargs)
         except Exception as e:
