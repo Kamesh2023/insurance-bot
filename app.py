@@ -483,6 +483,11 @@ with st.sidebar:
             st.success(f"Loaded: {st.session_state.uploaded_name}")
             st.caption("Try: \"What are the exclusions in my policy?\"")
 
+# ---- If the last question never got an answer, it was stopped ----
+stopped_question = None
+if st.session_state.history and st.session_state.history[-1]["role"] == "user":
+    stopped_question = st.session_state.history.pop()["content"]
+
 # ---- Chat history ----
 for i, m in enumerate(st.session_state.history):
     with st.chat_message(m["role"]):
@@ -490,10 +495,16 @@ for i, m in enumerate(st.session_state.history):
         if m["role"] == "assistant" and i > 0:
             pdf_button(st.session_state.history[i - 1]["content"], m["content"], key=f"pdf_{i}")
 
+if stopped_question:
+    st.info(f"⏹ Stopped. You asked: \"{stopped_question}\". Ask again or try a different question.")
+
 if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies..."):
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+    # Clicking any button makes Streamlit restart the page, which ends the current research.
+    stop_area = st.empty()
+    stop_area.button("⏹ Stop", key="stop_button", help="Stop researching this question")
     with st.chat_message("assistant"):
         st.session_state.credits_used = 0
         with st.spinner("Researching..."):
@@ -513,6 +524,7 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
                     st.error(f"Something went wrong: {err}")
                 st.session_state.history.pop()  # drop the unanswered question
                 st.stop()
+        stop_area.empty()  # research finished, hide the Stop button
         st.markdown(answer)
         st.caption(f"Tavily credits used for this answer: about {st.session_state.credits_used}")
         pdf_button(prompt, answer, key=f"pdf_{len(st.session_state.history)}")
