@@ -51,8 +51,9 @@ llm = OpenAI(
 # If you turn on billing, set GEMINI_RPM in Secrets (e.g. "100") to lift the main model's pace.
 MODEL_PLAN = [
     (MODEL, int(get_setting("GEMINI_RPM", 4))),
-    ("gemini-2.5-flash-lite", 9),
-    ("gemini-2.5-flash", 4),
+    ("gemini-3.6-flash", 4),
+    ("gemini-3.5-flash-lite", 9),
+    ("gemini-3.1-flash-lite", 9),
 ]
 
 
