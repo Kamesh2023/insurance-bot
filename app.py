@@ -1,11 +1,13 @@
 import os
 import io
 import json
+import time
 from datetime import date
 
 import markdown
 import streamlit as st
 from fpdf import FPDF
+from fpdf.fonts import TextStyle
 from pypdf import PdfReader
 from openai import OpenAI
 from tavily import TavilyClient
@@ -38,7 +40,24 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 llm = OpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    max_retries=2,
 )
+
+
+def ask_gemini(**kwargs):
+    """Call Gemini; if the free-tier per-minute limit is hit, wait and try again."""
+    waits = [15, 30, 45]  # seconds
+    for attempt in range(len(waits) + 1):
+        try:
+            return llm.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "429" not in str(e) or attempt == len(waits):
+                raise
+            note = st.empty()
+            for left in range(waits[attempt], 0, -1):
+                note.caption(f"⏳ Free-tier limit reached, retrying in {left}s...")
+                time.sleep(1)
+            note.empty()
 
 # Sources the bot searches first. Edit this list freely.
 TRUSTED_DOMAINS = [
@@ -82,7 +101,13 @@ Rules:
    in plain language.
 5. Do not tell the user which policy to buy. Explain trade-offs against the needs they
    describe, and suggest they confirm with the insurer or an IRDAI-licensed advisor.
-6. End every answer with a "Sources" list of the URLs you used, and note that
+6. For regulatory and market questions (IRDAI circulars, consultation papers, effects on
+   insurers or listed companies): give the document's name, date and current status
+   (draft / final / in force), summarise what it proposes, then report who analysts
+   and news sources say benefits or loses, attributing each view to its source.
+   Separate what the regulator said from what commentators expect. Do not give buy or
+   sell recommendations on any stock.
+7. End every answer with a "Sources" list of the URLs you used, and note that
    terms can change.
 """
 
@@ -199,6 +224,61 @@ def pdf_safe(text: str) -> str:
     return text.encode("latin-1", "ignore").decode("latin-1")
 
 
+def split_tables(text: str) -> list:
+    """Split markdown into ('text', ...) and ('table', [rows]) blocks."""
+    blocks, buf, rows = [], [], []
+    for line in text.splitlines() + [""]:
+        if line.strip().startswith("|"):
+            if buf:
+                blocks.append(("text", "\n".join(buf)))
+                buf = []
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if not all(set(c) <= set(":- ") for c in cells):  # skip |---|---| line
+                rows.append(cells)
+        else:
+            if rows:
+                blocks.append(("table", rows))
+                rows = []
+            buf.append(line)
+    if buf:
+        blocks.append(("text", "\n".join(buf)))
+    return blocks
+
+
+def write_markdown_text(pdf: FPDF, text: str):
+    if not text.strip():
+        return
+    heading = dict(color="#1F3A5F", b_margin=2)
+    pdf.write_html(
+        markdown.markdown(text),
+        font_family="helvetica",
+        tag_styles={
+            "h1": TextStyle(font_size_pt=15, t_margin=6, **heading),
+            "h2": TextStyle(font_size_pt=13, t_margin=5, **heading),
+            "h3": TextStyle(font_size_pt=12, t_margin=4, **heading),
+        },
+    )
+
+
+def draw_table(pdf: FPDF, rows: list):
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 9)
+    with pdf.table(
+        text_align="LEFT",
+        line_height=5,
+        first_row_as_headings=True,  # first row is shown in bold
+        markdown=True,  # keeps **bold** inside cells
+    ) as table:
+        for i, r in enumerate(rows):
+            row = table.row()
+            for cell in r:
+                row.cell(cell.replace("**", "") if i == 0 else cell)
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "", 10)
+
+
 @st.cache_data(show_spinner=False)
 def answer_to_pdf(question: str, answer: str) -> bytes:
     pdf = FPDF()
@@ -214,8 +294,11 @@ def answer_to_pdf(question: str, answer: str) -> bytes:
     pdf.ln(3)
     pdf.set_font("Helvetica", "", 10)
     try:
-        html = markdown.markdown(pdf_safe(answer), extensions=["tables"])
-        pdf.write_html(html, table_line_separators=True)
+        for kind, block in split_tables(pdf_safe(answer)):
+            if kind == "table":
+                draw_table(pdf, block)
+            else:
+                write_markdown_text(pdf, block)
     except Exception:
         # Fallback: plain text if the formatted version can't be laid out
         pdf.multi_cell(0, 5, pdf_safe(answer))
@@ -312,9 +395,9 @@ def run_agent(history: list) -> str:
                 "content": "Stop researching now. Answer with what you have found so far, "
                            "clearly saying what you could not confirm, and list the sources.",
             })
-            resp = llm.chat.completions.create(model=MODEL, messages=messages)
+            resp = ask_gemini(model=MODEL, messages=messages)
             return resp.choices[0].message.content or ""
-        resp = llm.chat.completions.create(model=MODEL, messages=messages, tools=tools)
+        resp = ask_gemini(model=MODEL, messages=messages, tools=tools)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
@@ -389,7 +472,11 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
             except Exception as e:
                 err = str(e)
                 if "429" in err:
-                    st.error("Free-tier limit reached. Wait a minute and try again.")
+                    st.error(
+                        "Gemini's free-tier limit was reached and retrying didn't help. "
+                        "Try again in a few minutes. If it keeps happening, today's free "
+                        "quota may be used up; it resets daily."
+                    )
                 elif "404" in err or "not found" in err.lower():
                     st.error(f"The model '{MODEL}' wasn't found. Set GEMINI_MODEL to a current Gemini model name.")
                 else:
