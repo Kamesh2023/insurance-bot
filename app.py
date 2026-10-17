@@ -45,49 +45,78 @@ llm = OpenAI(
 )
 
 
-# Requests per minute the app will send. Free tier for this model allows 5; we use 4 for a safety margin.
-# If you turn on billing, set GEMINI_RPM in Secrets to a higher number, e.g. 100.
-GEMINI_RPM = int(get_setting("GEMINI_RPM", 4))
+# Models to use, in order of preference, with the requests per minute the app will
+# send to each (a little under each model's free-tier limit). Each model has its own
+# separate free allowance, so when one is busy or used up the app moves to the next.
+# If you turn on billing, set GEMINI_RPM in Secrets (e.g. "100") to lift the main model's pace.
+MODEL_PLAN = [
+    (MODEL, int(get_setting("GEMINI_RPM", 4))),
+    ("gemini-2.5-flash-lite", 9),
+    ("gemini-2.5-flash", 4),
+]
 
 
 @st.cache_resource
-def shared_request_log():
-    """One log shared by ALL visitors, because they all use the same Gemini quota."""
-    return {"times": [], "lock": threading.Lock()}
+def shared_model_state():
+    """Shared by ALL visitors, because they all use the same Gemini quota."""
+    return {"lock": threading.Lock(), "times": {}, "cool_until": {}}
 
 
-def wait_for_free_slot():
-    """Hold the request until it fits within GEMINI_RPM over the last 60 seconds."""
-    log = shared_request_log()
-    note = st.empty()
-    while True:
-        with log["lock"]:
-            now = time.time()
-            log["times"] = [t for t in log["times"] if now - t < 60]
-            if len(log["times"]) < GEMINI_RPM:
-                log["times"].append(now)
-                note.empty()
-                return
-            wait = int(60 - (now - log["times"][0])) + 1
-        note.caption(f"⏳ Pacing requests to stay within the free limit... about {wait}s")
-        time.sleep(min(wait, 5))
+def take_slot(model: str, rpm: int) -> bool:
+    """Reserve a request for this model if it is under its per-minute pace and not cooling down."""
+    state = shared_model_state()
+    with state["lock"]:
+        now = time.time()
+        if state["cool_until"].get(model, 0) > now:
+            return False
+        recent = [t for t in state["times"].get(model, []) if now - t < 60]
+        if len(recent) >= rpm:
+            state["times"][model] = recent
+            return False
+        recent.append(now)
+        state["times"][model] = recent
+        return True
+
+
+def cool_down(model: str, err: str):
+    """After a refusal, rest this model: an hour if the daily quota is gone, else a minute."""
+    daily = "day" in err.lower()
+    state = shared_model_state()
+    with state["lock"]:
+        state["cool_until"][model] = time.time() + (3600 if daily else 60)
 
 
 def ask_gemini(**kwargs):
-    """Call Gemini within the per-minute limit; if still refused, wait and try again."""
-    waits = [15, 30, 45]  # seconds
-    for attempt in range(len(waits) + 1):
-        wait_for_free_slot()
-        try:
-            return llm.chat.completions.create(**kwargs)
-        except Exception as e:
-            if "429" not in str(e) or attempt == len(waits):
+    """Send the request to the first model that has room; wait only if none do."""
+    kwargs.pop("model", None)
+    note = st.empty()
+    last_error = "429 all models busy"
+    deadline = time.time() + 180  # give up after 3 minutes of waiting
+    while time.time() < deadline:
+        for model, rpm in MODEL_PLAN:
+            if not take_slot(model, rpm):
+                continue
+            try:
+                resp = llm.chat.completions.create(model=model, **kwargs)
+                note.empty()
+                st.session_state.models_used = st.session_state.get("models_used", set()) | {model}
+                return resp
+            except Exception as e:
+                err = str(e)
+                if "429" in err:
+                    cool_down(model, err)
+                    last_error = err
+                    continue
+                if model != MODEL_PLAN[0][0] and ("400" in err or "404" in err):
+                    # a back-up model couldn't handle this conversation; skip it for now
+                    cool_down(model, "")
+                    last_error = err
+                    continue
                 raise
-            note = st.empty()
-            for left in range(waits[attempt], 0, -1):
-                note.caption(f"⏳ Free-tier limit reached, retrying in {left}s...")
-                time.sleep(1)
-            note.empty()
+        note.caption("⏳ All free Gemini models are busy, waiting a few seconds...")
+        time.sleep(5)
+    note.empty()
+    raise Exception(last_error)
 
 # Sources the bot searches first. Edit this list freely.
 TRUSTED_DOMAINS = [
@@ -507,6 +536,7 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
     stop_area.button("⏹ Stop", key="stop_button", help="Stop researching this question")
     with st.chat_message("assistant"):
         st.session_state.credits_used = 0
+        st.session_state.models_used = set()
         with st.spinner("Researching..."):
             try:
                 answer = run_agent(st.session_state.history)
@@ -514,7 +544,7 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
                 err = str(e)
                 if "429" in err:
                     st.error(
-                        "Gemini's free-tier limit was reached and retrying didn't help. "
+                        "All free Gemini models are at their limit right now. "
                         "Try again in a few minutes. If it keeps happening, today's free "
                         "quota may be used up; it resets daily."
                     )
@@ -526,6 +556,9 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
                 st.stop()
         stop_area.empty()  # research finished, hide the Stop button
         st.markdown(answer)
-        st.caption(f"Tavily credits used for this answer: about {st.session_state.credits_used}")
+        models = ", ".join(sorted(st.session_state.get("models_used", set()))) or "-"
+        st.caption(
+            f"Tavily credits used: about {st.session_state.credits_used} · Gemini model(s): {models}"
+        )
         pdf_button(prompt, answer, key=f"pdf_{len(st.session_state.history)}")
     st.session_state.history.append({"role": "assistant", "content": answer})
