@@ -59,7 +59,7 @@ MODEL_PLAN = [
 @st.cache_resource
 def shared_model_state():
     """Shared by ALL visitors, because they all use the same Gemini quota."""
-    return {"lock": threading.Lock(), "times": {}, "cool_until": {}}
+    return {"lock": threading.Lock(), "times": {}, "cool_until": {}, "reason": {}}
 
 
 def take_slot(model: str, rpm: int) -> bool:
@@ -80,10 +80,28 @@ def take_slot(model: str, rpm: int) -> bool:
 
 def cool_down(model: str, err: str):
     """After a refusal, rest this model: an hour if the daily quota is gone, else a minute."""
-    daily = "day" in err.lower()
+    daily = "429" in err and "day" in err.lower()
+    if daily:
+        reason = "daily free limit used up"
+    elif "429" in err:
+        reason = "per-minute limit, resting 1 min"
+    else:
+        reason = "error: " + err[:160]
     state = shared_model_state()
     with state["lock"]:
-        state["cool_until"][model] = time.time() + (3600 if daily else 60)
+        minute_limit = "429" in err and not daily
+        state["cool_until"][model] = time.time() + (60 if minute_limit else 3600)
+        state["reason"][model] = reason
+
+
+def model_status_text() -> str:
+    state = shared_model_state()
+    now = time.time()
+    parts = []
+    for model, _ in MODEL_PLAN:
+        if state["cool_until"].get(model, 0) > now:
+            parts.append(f"{model}: {state['reason'].get(model, 'resting')}")
+    return " | ".join(parts)
 
 
 def ask_gemini(**kwargs):
@@ -109,14 +127,14 @@ def ask_gemini(**kwargs):
                     continue
                 if model != MODEL_PLAN[0][0] and ("400" in err or "404" in err):
                     # a back-up model couldn't handle this conversation; skip it for now
-                    cool_down(model, "")
+                    cool_down(model, err)
                     last_error = err
                     continue
                 raise
-        note.caption("⏳ All free Gemini models are busy, waiting a few seconds...")
+        note.caption("⏳ All free Gemini models are busy, waiting a few seconds... " + model_status_text())
         time.sleep(5)
     note.empty()
-    raise Exception(last_error)
+    raise Exception(last_error + " || " + model_status_text())
 
 # Sources the bot searches first. Edit this list freely.
 TRUSTED_DOMAINS = [
@@ -548,6 +566,8 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
                         "Try again in a few minutes. If it keeps happening, today's free "
                         "quota may be used up; it resets daily."
                     )
+                    if " || " in err:
+                        st.caption("Details: " + err.split(" || ", 1)[1])
                 elif "404" in err or "not found" in err.lower():
                     st.error(f"The model '{MODEL}' wasn't found. Set GEMINI_MODEL to a current Gemini model name.")
                 else:
