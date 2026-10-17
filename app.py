@@ -1,6 +1,12 @@
 import os
+import io
 import json
+from datetime import date
+
+import markdown
 import streamlit as st
+from fpdf import FPDF
+from pypdf import PdfReader
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -148,6 +154,95 @@ def read_document(url: str, focus: str = "") -> dict:
     }
 
 
+def read_uploaded_policy(focus: str = "") -> dict:
+    text = st.session_state.get("uploaded_text", "")
+    if not text:
+        return {"error": "No policy document has been uploaded."}
+    return {
+        "document": st.session_state.get("uploaded_name", "uploaded policy"),
+        "focus": focus,
+        "relevant_text": pick_relevant_parts(text, focus),
+    }
+
+
+UPLOAD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_uploaded_policy",
+        "description": "Read the policy document the user uploaded. Returns the parts most relevant to 'focus'. Free to call; call again with a different focus if needed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "Key words for what you need, e.g. 'room rent limit'",
+                },
+            },
+            "required": ["focus"],
+        },
+    },
+}
+
+
+# ---------- PDF download of an answer ----------
+PDF_REPLACEMENTS = {
+    "₹": "Rs. ", "“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-",
+    "•": "-", "…": "...", "≥": ">=", "≤": "<=", "×": "x", " ": " ", "✓": "Yes",
+    "✗": "No", "→": "->",
+}
+
+
+def pdf_safe(text: str) -> str:
+    """The built-in PDF font only handles basic characters; swap the common others."""
+    for old, new in PDF_REPLACEMENTS.items():
+        text = text.replace(old, new)
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
+@st.cache_data(show_spinner=False)
+def answer_to_pdf(question: str, answer: str) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Insurance Policy Assistant", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Generated on {date.today():%d %B %Y}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.multi_cell(0, 6, pdf_safe("Question: " + question))
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "", 10)
+    try:
+        html = markdown.markdown(pdf_safe(answer), extensions=["tables"])
+        pdf.write_html(html, table_line_separators=True)
+    except Exception:
+        # Fallback: plain text if the formatted version can't be laid out
+        pdf.multi_cell(0, 5, pdf_safe(answer))
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.multi_cell(
+        0, 4,
+        "For information only - not financial advice. Policy terms change; "
+        "always verify with the insurer or an IRDAI-licensed advisor.",
+    )
+    return bytes(pdf.output())
+
+
+def pdf_button(question: str, answer: str, key: str):
+    try:
+        data = answer_to_pdf(question, answer)
+    except Exception:
+        return  # never let a PDF problem break the chat
+    st.download_button(
+        "⬇️ Download as PDF",
+        data=data,
+        file_name=f"insurance-answer-{date.today():%Y%m%d}.pdf",
+        mime="application/pdf",
+        key=key,
+    )
+
+
 TOOLS = [
     {
         "type": "function",
@@ -187,11 +282,27 @@ TOOLS = [
     },
 ]
 
-FUNCTIONS = {"web_search": web_search, "read_document": read_document}
+FUNCTIONS = {
+    "web_search": web_search,
+    "read_document": read_document,
+    "read_uploaded_policy": read_uploaded_policy,
+}
 
 
 def run_agent(history: list) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-10:]
+    system = SYSTEM_PROMPT
+    tools = list(TOOLS)
+    if st.session_state.get("uploaded_text"):
+        name = st.session_state.get("uploaded_name", "uploaded policy")
+        system += (
+            f"\nThe user has uploaded a policy document named '{name}'. "
+            "For questions about 'my policy', 'this policy' or 'the document', use "
+            "read_uploaded_policy first (it is free) and cite it as "
+            f"'Uploaded document: {name}' with the section name. Use web_search only "
+            "for things the document doesn't cover, such as comparisons with other policies.\n"
+        )
+        tools.append(UPLOAD_TOOL)
+    messages = [{"role": "system", "content": system}] + history[-10:]
     max_steps = 8
     for step in range(max_steps):
         if step == max_steps - 1:
@@ -203,14 +314,14 @@ def run_agent(history: list) -> str:
             })
             resp = llm.chat.completions.create(model=MODEL, messages=messages)
             return resp.choices[0].message.content or ""
-        resp = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS)
+        resp = llm.chat.completions.create(model=MODEL, messages=messages, tools=tools)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
             args = json.loads(call.function.arguments or "{}")
-            label = args.get("query") or args.get("url")
+            label = args.get("query") or args.get("url") or args.get("focus")
             st.caption(f"🔎 {call.function.name}: {label}")
             try:
                 result = FUNCTIONS[call.function.name](**args)
@@ -229,9 +340,42 @@ st.caption("For information only — not financial advice. Always verify with th
 if "history" not in st.session_state:
     st.session_state.history = []
 
-for m in st.session_state.history:
+# ---- Sidebar: upload your own policy ----
+with st.sidebar:
+    st.header("📄 Your policy document")
+    st.caption(
+        "Upload a policy wording or schedule (PDF) to ask questions about it. "
+        "Don't upload documents with personal or medical details: on the free "
+        "plan, Google may use what's sent to improve its products."
+    )
+    uploaded = st.file_uploader("Upload a policy PDF", type="pdf")
+    if uploaded is not None and uploaded.name != st.session_state.get("uploaded_name"):
+        try:
+            reader = PdfReader(io.BytesIO(uploaded.getvalue()))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception:
+            text = ""
+        st.session_state.uploaded_name = uploaded.name
+        st.session_state.uploaded_text = text
+    if uploaded is None and st.session_state.get("uploaded_name"):
+        st.session_state.uploaded_name = None
+        st.session_state.uploaded_text = ""
+    if st.session_state.get("uploaded_name"):
+        if len(st.session_state.get("uploaded_text", "")) < 200:
+            st.warning(
+                "No readable text found. This may be a scanned PDF (a picture of pages), "
+                "which this version can't read."
+            )
+        else:
+            st.success(f"Loaded: {st.session_state.uploaded_name}")
+            st.caption("Try: \"What are the exclusions in my policy?\"")
+
+# ---- Chat history ----
+for i, m in enumerate(st.session_state.history):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        if m["role"] == "assistant" and i > 0:
+            pdf_button(st.session_state.history[i - 1]["content"], m["content"], key=f"pdf_{i}")
 
 if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies..."):
     st.session_state.history.append({"role": "user", "content": prompt})
@@ -254,4 +398,5 @@ if prompt := st.chat_input("Ask about an insurer, a policy, or compare policies.
                 st.stop()
         st.markdown(answer)
         st.caption(f"Tavily credits used for this answer: about {st.session_state.credits_used}")
+        pdf_button(prompt, answer, key=f"pdf_{len(st.session_state.history)}")
     st.session_state.history.append({"role": "assistant", "content": answer})

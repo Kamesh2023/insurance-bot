@@ -1,3 +1,6 @@
 streamlit
 openai
 tavily-python
+fpdf2
+markdown
+pypdf
